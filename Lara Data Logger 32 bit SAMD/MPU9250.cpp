@@ -242,6 +242,9 @@ void MPU9250::setMotionIntProcess() {
     MPU9250::writeSPI(MPU9250_RA_MOT_DETECT_CTRL, 0b11000000);
     MPU9250::writeSPI(MPU9250_RA_MOT_THR, 0b00000111);  //4 mg per LSB
 }
+void MPU9250::setDataRdyInt() {
+    MPU9250::writeSPI(MPU9250_RA_INT_ENABLE, 0b00000001);
+}
 
 // sets the int pin to interrupt when motion is detected
 void MPU9250::clearMotionIntProcess() {
@@ -273,12 +276,10 @@ void MPU9250::initialize() {
         //Set the slave pin to an output
         pinMode(SlaveSelect, OUTPUT);
         
-        
         MPU9250::writeSPI(MPU9250_RA_PWR_MGMT_1,0x01);
-        MPU9250::writeSPI(MPU9250_RA_INT_PIN_CFG, 0b00000010);	//enable i2c passthrough
-        MPU9250::writeSPI(MPU9250_RA_USER_CTRL, 0b00010000);	//disable i2c master & enable SPI
+        //MPU9250::writeSPI(MPU9250_RA_INT_PIN_CFG, 0b00000010);	//enable i2c passthrough
+        MPU9250::writeSPI(MPU9250_RA_USER_CTRL, 0b00010000);	//fifo disable, disable i2c master & enable SPI
         MPU9250::writeSPI(MPU9250_RA_CONFIG, 0b00000101);	//disable Fsync and 10hz DLPF
-        MPU9250::writeSPI(MPU9250_RA_FIFO_EN , 0x00);	//disable FIFO
         
     }
     else {
@@ -2002,6 +2003,29 @@ void MPU9250::getMotion6(int16_t* ax, int16_t* ay, int16_t* az, int16_t* gx, int
     *gy = (((int16_t)buffer[10]) << 8) | buffer[11];
     *gz = (((int16_t)buffer[12]) << 8) | buffer[13];
 }
+
+void MPU9250::getMotion6FIFO(int16_t* ax, int16_t* ay, int16_t* az, int16_t* gx, int16_t* gy, int16_t* gz) {
+    
+    MPU9250::readSPI(MPU9250_RA_FIFO_R_W, buffer, 12); // read data for averaging
+
+    
+    *ax = (((int16_t)buffer[0]) << 8) | buffer[1];
+    *ay = (((int16_t)buffer[2]) << 8) | buffer[3];
+    *az = (((int16_t)buffer[4]) << 8) | buffer[5];
+    *gx = (((int16_t)buffer[6]) << 8) | buffer[7];
+    *gy = (((int16_t)buffer[8]) << 8) | buffer[9];
+    *gz = (((int16_t)buffer[10]) << 8) | buffer[11];
+     
+    /*
+    *gz = (((int16_t)buffer[1]) << 8) | buffer[0];
+    *gy = (((int16_t)buffer[3]) << 8) | buffer[2];
+    *gx = (((int16_t)buffer[5]) << 8) | buffer[4];
+    *az = (((int16_t)buffer[7]) << 8) | buffer[6];
+    *ay = (((int16_t)buffer[9]) << 8) | buffer[8];
+    *ax = (((int16_t)buffer[11]) << 8) | buffer[10];
+     */
+    
+}
 /** Get 3-axis accelerometer readings.
  * These registers store the most recent accelerometer measurements.
  * Accelerometer measurements are written to these registers at the Sample Rate
@@ -2907,8 +2931,15 @@ void MPU9250::setStandbyZGyroEnabled(bool enabled) {
  * @return Current FIFO buffer size
  */
 uint16_t MPU9250::getFIFOCount() {
-    I2Cdev::readBytes(devAddr, MPU9250_RA_FIFO_COUNTH, 2, buffer);
-    return (((uint16_t)buffer[0]) << 8) | buffer[1];
+    if(useSPI) {
+        MPU9250::readSPI(MPU9250_RA_FIFO_COUNTH, buffer, 2);
+        return (((uint16_t)buffer[0]) << 8) | buffer[1];
+    }
+    else {
+        I2Cdev::readBytes(devAddr, MPU9250_RA_FIFO_COUNTH, 2, buffer);
+        return (((uint16_t)buffer[0]) << 8) | buffer[1];
+    }
+    
 }
 
 // FIFO_R_W register
@@ -2943,7 +2974,12 @@ uint8_t MPU9250::getFIFOByte() {
     return buffer[0];
 }
 void MPU9250::getFIFOBytes(uint8_t *data, uint8_t length) {
-    I2Cdev::readBytes(devAddr, MPU9250_RA_FIFO_R_W, length, data);
+    if (useSPI) {
+        MPU9250::readSPI(MPU9250_RA_FIFO_R_W, data, length);
+    }
+    else {
+        I2Cdev::readBytes(devAddr, MPU9250_RA_FIFO_R_W, length, data);
+    }
 }
 /** Write byte to FIFO buffer.
  * @see getFIFOByte()

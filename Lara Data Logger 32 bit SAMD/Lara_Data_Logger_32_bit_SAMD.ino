@@ -67,12 +67,14 @@
 //#define ECHO        // Sets up a serial Monitor at 115200 baud
 #define LOG      //logging macro define (takes a bit of memory to log)
 //#define SET_rtc       //resets rtc time and date to the time of this compilation
+#define POT         //pot lever angle measurement test
 
-#define sampleFreq 100.0f		// sample frequency in Hz
+#define sampleFreq 500.0f		// sample frequency in Hz
+#define gyroSampleFreq 50.0f		// sample frequency in Hz
 
 //int logFreq = 30;
 //int sampleFreq = 30;
-#define SAMPLE_RATE_DIV (1000/sampleFreq) - 1
+#define SAMPLE_RATE_DIV (1000/gyroSampleFreq) - 1
 
 
 //----------- Prototypes --------------//
@@ -107,11 +109,13 @@ double logTime = 0;
 byte bytes_written = 0;
 
 // Build a buffer array to write to a file
-const int bufferSize = 4800;
+const int bufferSize = 5000;
 //const int bufferSize = 480;
 //const int bufferSize = 18;
 uint8_t buffer[bufferSize];
-uint8_t dataBlock = 48;     //how much data to store per cycle in bytes
+uint8_t dataToWrite[bufferSize];
+bool timeToWrite = false;
+uint8_t dataBlock = 50;     //how much data to store per cycle in bytes
 int writeCounter= 0;
 boolean hour_transition_began = false;
 
@@ -131,6 +135,17 @@ MPU9250 IMU2(NCS2,1000000);   //initialize for SPI at 1 MHz for 2nd IMU
 bool IMU1_online = false;
 bool IMU2_online = false;
 
+uint16_t fifoCount[2] = {0,0};
+uint16_t packet_count;
+uint8_t fifoBufferIMU1[512];
+uint8_t fifoBufferIMU2[512];
+uint8_t Remainder[2] = {0,0};
+uint8_t cyclesBehind = 0;
+uint8_t numberPackets[2];
+
+bool dataRdyIntSet = false;
+bool gyroDataRdy = false;
+
 //extern volatile float beta;				// algorithm gain
 //extern volatile float q0, q1, q2, q3;	// quaternion of sensor frame relative to auxiliary frame
 
@@ -149,6 +164,7 @@ Vector3<float> Gyro_left;  //elem 1: x, 2: y, 3: z
 // attitude will represent the lever in euler angles
 Vector3<float> Attitude_right_lever(0.0f,0.0f,0.0f);    //elem 1: yaw, 2: pitch, 3: roll
 Vector3<float> Attitude_left_lever(0.0f,0.0f,0.0f);     //elem 1: yaw, 2: pitch, 3: roll
+
 
 // http://quat.zachbennett.com
 float quanternion_right[4] = {0.41f, 0.58f, -0.47f, -0.52f};  //sensor frame relative to the earth frame
@@ -176,9 +192,11 @@ double millisAtTopHour = 0;
 int prevHour;
 bool relMillisSet = false;
 long milliseconds;
+long millisecondsFIFORead;
 uint8_t currentMinute = 0;
 uint8_t previousMinute = 0;
 uint32_t currentMillisecond = 0;
+uint8_t MINUTE,SECOND;
 
 DateTime Now;
 String Day;
@@ -232,6 +250,10 @@ int WheelRightRot = 0;
 
 float wheelResolution = 4;    // how many magnets on the wheel.
 
+//pot
+int potVal;
+int potAngle;
+
 //----------- Setup ----------------/
 void setup()
 {
@@ -255,6 +277,9 @@ void setup()
     while (!Serial) {
         ; // wait for serial port to connect. Needed for native USB port only
     }
+#endif
+#ifdef POT
+    pinMode(A0,INPUT);
 #endif
     
     //---------- Set up rtc --------------------//
@@ -296,7 +321,7 @@ void setup()
         IMU1.setFullScaleGyroRange(MPU9250_GYRO_FS_250);
         IMU1.setFullScaleAccelRange(MPU9250_ACCEL_FS_2);
         IMU1.setRate((uint8_t)SAMPLE_RATE_DIV);
-        IMU1.setMotionIntProcess();
+        //IMU1.setDataRdyInt();
     }
     else {
         IMU1_online = false;
@@ -310,7 +335,7 @@ void setup()
         IMU2.setFullScaleGyroRange(MPU9250_GYRO_FS_250);
         IMU2.setFullScaleAccelRange(MPU9250_ACCEL_FS_2);
         IMU2.setRate((uint8_t)SAMPLE_RATE_DIV);
-        IMU2.setMotionIntProcess(); //sets the INT pin on the MPU to send an interrupt when it senses motion
+        //IMU2.setDataRdyInt(); //sets the INT pin on the MPU to send an interrupt when it senses motion
     }
     else {
         IMU2_online = false;
@@ -392,10 +417,15 @@ void loop()
 {
     
     begin_of_loop = millis();
+    if(!dataRdyIntSet) {
+        IMU1.setDataRdyInt();
+        IMU2.setDataRdyInt(); //sets the INT pin on the MPU to send an interrupt when it senses motion
+        dataRdyIntSet = true;
+    }
     
     //----------- IMU Get Data & process ----------------//
     
-    if(IMU1_online) {
+    if(IMU1_online && gyroDataRdy) {
         IMU1.getMotion6(&Acc_raw_right[0], &Acc_raw_right[1], &Acc_raw_right[2], &Gyro_raw_right[0], &Gyro_raw_right[1], &Gyro_raw_right[2]);
         
         Acc_right[0] = Acc_raw_right[0] * 2.0f/32768.0f; // 2 g full range for accelerometer
@@ -415,7 +445,7 @@ void loop()
         
     }
     
-    if(IMU2_online) {
+    if(IMU2_online && gyroDataRdy) {
         IMU2.getMotion6(&Acc_raw_left[0], &Acc_raw_left[1], &Acc_raw_left[2], &Gyro_raw_left[0], &Gyro_raw_left[1], &Gyro_raw_left[2]);
         
         Acc_left[0] = Acc_raw_left[0] * 2.0f/32768.0f; // 2 g full range for accelerometer
@@ -432,15 +462,23 @@ void loop()
         MadgwickAHRSupdateIMU(Gyro_left, Acc_left, quanternion_left, Attitude_left_lever);
         
     }
+     
     
+    // pot
+#ifdef POT
+    potVal = analogRead(A0);
+    potAngle = map(potVal, 200, 445, 0, 90);
+#endif
         
     //------------------ SD Card Logging -------------------------------------//
     
 #ifdef LOG
     
     // if the file is available, write to it:
-    if (SD_card_present) {
+    if (SD_card_present && gyroDataRdy) {
         Now = rtc.now();
+        MINUTE = Now.minute();
+        SECOND = Now.second();
         
         // reset millis every hour
         if(Now.hour() != prevHour) {
@@ -452,22 +490,21 @@ void loop()
             prevHour = Now.hour();
         }
         
-        // Hour transition handling
-        currentMinute = Now.minute();
+        //---------- Fill up the buffer ---------------------//
+        
+        milliseconds = (uint32_t)millis();
         
         // Begin building the buffer array
-        buffer[writeCounter+0] = Now.minute();
-        buffer[writeCounter+1] = Now.second();
+        buffer[writeCounter+0] = MINUTE;
+        buffer[writeCounter+1] = SECOND;
         
-        //milliseconds = (long)(millis()-millisAtTopHour);
-        milliseconds = (uint32_t)millis();
         //split the long into 4 bytes little endian
         buffer[writeCounter+5] = milliseconds >> 24 & 0xFF;  //MSB
         buffer[writeCounter+4] = milliseconds >> 16 & 0xFF;  //CMSB
         buffer[writeCounter+3] = milliseconds >> 8 & 0xFF;  //CLSB
         buffer[writeCounter+2] = milliseconds & 0xFF;  //LSB
         
-         //----------- IMU Data -------------------//
+        //----------- IMU Data -------------------//
         if (IMU1_online) {
             // lever angle from madgwick algorithm
             buffer[writeCounter+6] = (int)Attitude_right_lever[1] >> 8 & 0xFF;   // MSB
@@ -480,7 +517,7 @@ void loop()
             buffer[writeCounter+11] = Gyro_raw_right[1] & 0xFF;        //LSB
             buffer[writeCounter+12] = Gyro_raw_right[2] >> 8 & 0xFF;   // MSB
             buffer[writeCounter+13] = Gyro_raw_right[2] & 0xFF;        //LSB
-         
+            
             //raw acc
             buffer[writeCounter+14] = Acc_raw_right[0] >> 8 & 0xFF;   // MSB
             buffer[writeCounter+15] = Acc_raw_right[0] & 0xFF;        //LSB
@@ -490,32 +527,32 @@ void loop()
             buffer[writeCounter+19] = Acc_raw_right[2] & 0xFF;        //LSB
         }
         else {
-             // lever angle from madgwick algorithm
-             buffer[writeCounter+6] = 0xFF;   // MSB
-             buffer[writeCounter+7] = 0xFF;        //LSB
-         
-             //raw gyro
-             buffer[writeCounter+8] = 0xFF;   // MSB
-             buffer[writeCounter+9] = 0xFF;        //LSB
-             buffer[writeCounter+10] = 0xFF;   // MSB
-             buffer[writeCounter+11] = 0xFF;        //LSB
-             buffer[writeCounter+12] = 0xFF;   // MSB
-             buffer[writeCounter+13] = 0xFF;        //LSB
-         
-             //raw acc
-             buffer[writeCounter+14] = 0xFF;   // MSB
-             buffer[writeCounter+15] = 0xFF;        //LSB
-             buffer[writeCounter+16] = 0xFF;   // MSB
-             buffer[writeCounter+17] = 0xFF;        //LSB
-             buffer[writeCounter+18] = 0xFF;   // MSB
-             buffer[writeCounter+19] = 0xFF;        //LSB
+            // lever angle from madgwick algorithm
+            buffer[writeCounter+6] = 0xFF;   // MSB
+            buffer[writeCounter+7] = 0xFF;        //LSB
+            
+            //raw gyro
+            buffer[writeCounter+8] = 0xFF;   // MSB
+            buffer[writeCounter+9] = 0xFF;        //LSB
+            buffer[writeCounter+10] = 0xFF;   // MSB
+            buffer[writeCounter+11] = 0xFF;        //LSB
+            buffer[writeCounter+12] = 0xFF;   // MSB
+            buffer[writeCounter+13] = 0xFF;        //LSB
+            
+            //raw acc
+            buffer[writeCounter+14] = 0xFF;   // MSB
+            buffer[writeCounter+15] = 0xFF;        //LSB
+            buffer[writeCounter+16] = 0xFF;   // MSB
+            buffer[writeCounter+17] = 0xFF;        //LSB
+            buffer[writeCounter+18] = 0xFF;   // MSB
+            buffer[writeCounter+19] = 0xFF;        //LSB
         }
-         
+        
         if (IMU2_online) {
             // lever angle from madgwick algorithm
             buffer[writeCounter+20] = (int)Attitude_left_lever[1] >> 8 & 0xFF;   // MSB
             buffer[writeCounter+21] = (int)Attitude_left_lever[1] & 0xFF;        //LSB
-         
+            
             //raw gyro
             buffer[writeCounter+22] = Gyro_raw_left[0] >> 8 & 0xFF;   // MSB
             buffer[writeCounter+23] = Gyro_raw_left[0] & 0xFF;        //LSB
@@ -523,7 +560,7 @@ void loop()
             buffer[writeCounter+25] = Gyro_raw_left[1] & 0xFF;        //LSB
             buffer[writeCounter+26] = Gyro_raw_left[2] >> 8 & 0xFF;   // MSB
             buffer[writeCounter+27] = Gyro_raw_left[2] & 0xFF;        //LSB
-         
+            
             //raw acc
             buffer[writeCounter+28] = Acc_raw_left[0] >> 8 & 0xFF;   // MSB
             buffer[writeCounter+29] = Acc_raw_left[0] & 0xFF;        //LSB
@@ -536,7 +573,7 @@ void loop()
             // lever angle from madgwick algorithm
             buffer[writeCounter+20] = 0xFF;   // MSB
             buffer[writeCounter+21] = 0xFF;        //LSB
-         
+            
             //raw gyro
             buffer[writeCounter+22] = 0xFF;   // MSB
             buffer[writeCounter+23] = 0xFF;        //LSB
@@ -544,7 +581,7 @@ void loop()
             buffer[writeCounter+25] = 0xFF;        //LSB
             buffer[writeCounter+26] = 0xFF;   // MSB
             buffer[writeCounter+27] = 0xFF;        //LSB
-         
+            
             //raw acc
             buffer[writeCounter+28] = 0xFF;   // MSB
             buffer[writeCounter+29] = 0xFF;        //LSB
@@ -553,56 +590,37 @@ void loop()
             buffer[writeCounter+32] = 0xFF;   // MSB
             buffer[writeCounter+33] = 0xFF;        //LSB
         }
-         
-         //------------- Reed Data ----------------//
-         //raw reed data and counter
-         buffer[writeCounter+34] = reed_stat_left[0] >> 8 & 0xFF;   // MSB
-         buffer[writeCounter+35] = reed_stat_left[0] & 0xFF;        //LSB
-         buffer[writeCounter+36] = reed_stat_left[1] >> 8 & 0xFF;   // MSB
-         buffer[writeCounter+37] = reed_stat_left[1] & 0xFF;        //LSB
-         buffer[writeCounter+38] = WheelLeftRot >> 8 & 0xFF;       // MSB
-         buffer[writeCounter+39] = WheelLeftRot & 0xFF;            //LSB
-         
-         buffer[writeCounter+40] = reed_stat_right[0] >> 8 & 0xFF;   // MSB
-         buffer[writeCounter+41] = reed_stat_right[0] & 0xFF;        //LSB
-         buffer[writeCounter+42] = reed_stat_right[1] >> 8 & 0xFF;   // MSB
-         buffer[writeCounter+43] = reed_stat_right[1] & 0xFF;        //LSB
-         buffer[writeCounter+44] = WheelRightRot >> 8 & 0xFF;       // MSB
-         buffer[writeCounter+45] = WheelRightRot & 0xFF;            //LSB
-         
-         // ----------- Sample Rate ------------//
-         buffer[writeCounter+46] = (int)measured_cycle_rate >> 8 & 0xFF;   // MSB
-         buffer[writeCounter+47] = (int)measured_cycle_rate & 0xFF;        //LSB
         
+        //------------- Reed Data ----------------//
+        //raw reed data and counter
+        buffer[writeCounter+34] = reed_stat_left[0] >> 8 & 0xFF;   // MSB
+        buffer[writeCounter+35] = reed_stat_left[0] & 0xFF;        //LSB
+        buffer[writeCounter+36] = reed_stat_left[1] >> 8 & 0xFF;   // MSB
+        buffer[writeCounter+37] = reed_stat_left[1] & 0xFF;        //LSB
+        buffer[writeCounter+38] = WheelLeftRot >> 8 & 0xFF;       // MSB
+        buffer[writeCounter+39] = WheelLeftRot & 0xFF;            //LSB
         
-        /*
-        // lever angle from madgwick algorithm
-        buffer[writeCounter+6] = (int)Attitude_right_lever[1] >> 8 & 0xFF;   // MSB
-        buffer[writeCounter+7] = (int)Attitude_right_lever[1] & 0xFF;        //LSB
+        buffer[writeCounter+40] = reed_stat_right[0] >> 8 & 0xFF;   // MSB
+        buffer[writeCounter+41] = reed_stat_right[0] & 0xFF;        //LSB
+        buffer[writeCounter+42] = reed_stat_right[1] >> 8 & 0xFF;   // MSB
+        buffer[writeCounter+43] = reed_stat_right[1] & 0xFF;        //LSB
+        buffer[writeCounter+44] = WheelRightRot >> 8 & 0xFF;       // MSB
+        buffer[writeCounter+45] = WheelRightRot & 0xFF;            //LSB
         
-        // lever angle from madgwick algorithm
-        buffer[writeCounter+8] = (int)Attitude_left_lever[1] >> 8 & 0xFF;   // MSB
-        buffer[writeCounter+9] = (int)Attitude_left_lever[1] & 0xFF;        //LSB
+        // ----------- Sample Rate ------------//
+        buffer[writeCounter+46] = (int)measured_cycle_rate >> 8 & 0xFF;   // MSB
+        buffer[writeCounter+47] = (int)measured_cycle_rate & 0xFF;        //LSB
         
-        buffer[writeCounter+10] = WheelLeftRot >> 8 & 0xFF;       // MSB
-        buffer[writeCounter+11] = WheelLeftRot & 0xFF;            //LSB
-        
-        buffer[writeCounter+12] = WheelRightRot >> 8 & 0xFF;       // MSB
-        buffer[writeCounter+13] = WheelRightRot & 0xFF;            //LSB
-        
-        // gyro z right
-        Gyro_right = Gyro_right * 180.0f/PI;    //convert to degrees
-        buffer[writeCounter+14] = (int)Gyro_right[2] >> 8 & 0xFF;   // MSB
-        buffer[writeCounter+15] = (int)Gyro_right[2] & 0xFF;        //LSB
-        
-        // gyro z left
-        Gyro_left = Gyro_left * 180.0f/PI;    //convert to radians
-        buffer[writeCounter+16] = (int)Gyro_left[2] >> 8 & 0xFF;   // MSB
-        buffer[writeCounter+17] = (int)Gyro_left[2] & 0xFF;        //LSB
-        */
+        // ----------- pot angle ------------//
+        buffer[writeCounter+48] = potAngle >> 8 & 0xFF;   // MSB
+        buffer[writeCounter+49] = potAngle & 0xFF;        //LSB
         
         writeCounter += dataBlock; //increase the counter
+    
         
+        
+        // Hour transition handling
+        currentMinute = Now.minute();
         if (previousMinute > currentMinute ) {      // minute 59 goes to 0
             // transition occured, write all data to old file
             bytes_written = logfile.write(buffer,(writeCounter-dataBlock));  //dont write last packet since its past the hour;
@@ -629,22 +647,255 @@ void loop()
         
         //write the binary data if buffer is full or we are sleeping write every wake up
         if (writeCounter >= bufferSize || sleeping) {
+            // turn on and reset FIFO module
+            IMU1.writeSPI(MPU9250_RA_USER_CTRL, 0b01010000);	//fifo enable
+            IMU1.writeSPI(MPU9250_RA_USER_CTRL, 0b01010100);	//reset the fifo
+            
+            IMU2.writeSPI(MPU9250_RA_USER_CTRL, 0b01010000);	//fifo enable
+            IMU2.writeSPI(MPU9250_RA_USER_CTRL, 0b01010100);	//reset the fifo
+            
+            while(!gyroDataRdy);                                //wait for data ready interrupt to sync
+            gyroDataRdy = false;
+            millisecondsFIFORead = (uint32_t)millis();  //timestamp
+            
+            
+            IMU1.writeSPI(MPU9250_RA_FIFO_EN, 0b01111000);      //gyro and acc values
+            IMU2.writeSPI(MPU9250_RA_FIFO_EN, 0b01111000);      //gyro and acc values
+            
             
             bytes_written = logfile.write(buffer,bufferSize);
-            //logfile.close();
             //write bytes
             logfile.flush();
-            
             writeCounter = 0;
-        }
-    }
-    
-    
-    
+            
+            while(!gyroDataRdy);                                //wait for data ready interrupt to sync
+            gyroDataRdy = false;
+            
+            //disable FIFO once we are done writing to SD card
+            IMU1.writeSPI(MPU9250_RA_FIFO_EN, 0x00);        // Disable gyro and acc storage for FIFO
+            IMU2.writeSPI(MPU9250_RA_FIFO_EN, 0x00);        // Disable gyro and acc storage for FIFO
+            
+            //get the FIFO count
+            fifoCount[0] = IMU1.getFIFOCount();
+            fifoCount[1] = IMU2.getFIFOCount();
+            
+            Remainder[0] = fifoCount[0]%12;     //see if we did not capture a full packet
+            Remainder[1] = fifoCount[1]%12;     //see if we did not capture a full packet
+            
+            numberPackets[0] = (fifoCount[0] - Remainder[0])/12;
+            numberPackets[1] = (fifoCount[1] - Remainder[1])/12;
+            
+#ifdef ECHO
+            if(Remainder[0] > 0 || Remainder[1] > 0) {
+                Serial.println(Remainder[0]);
+                Serial.println(numberPackets[0]);
+                Serial.println(Remainder[1]);
+                Serial.println(numberPackets[1]);
+                delay(1000);
+            }
 #endif
+            
+            int ii;
+            for(ii = 0; ii<Remainder[0]; ii++) {
+                //skip the partial packet
+                //invoke read
+                IMU1.getFIFOCount();
+            }
+            int iii;
+            for(iii = 0; iii<Remainder[1]; iii++) {
+                //skip the partial packet
+                //invoke read
+                IMU2.getFIFOCount();
+            }
+            
+            // if they are not equal, equate them to the smallest packet so re reads wont occur
+            if(numberPackets[1] < numberPackets[0]) {
+                numberPackets[0] = numberPackets[1];
+            }
+            if(numberPackets[0] < numberPackets[1]) {
+                numberPackets[1] = numberPackets[0];
+            }
+            
+            // re set up the buffer
+            uint8_t j;
+            for(j = 0;j<numberPackets[1];j++) {
+                //right lever
+                IMU1.getMotion6FIFO(&Acc_raw_right[0], &Acc_raw_right[1], &Acc_raw_right[2], &Gyro_raw_right[0], &Gyro_raw_right[1], &Gyro_raw_right[2]);
+                
+                Acc_right[0] = Acc_raw_right[0] * 2.0f/32768.0f; // 2 g full range for accelerometer
+                Acc_right[1] = Acc_raw_right[1] * 2.0f/32768.0f; // 2 g full range for accelerometer
+                Acc_right[2] = Acc_raw_right[2] * 2.0f/32768.0f; // 2 g full range for accelerometer
+                
+                Gyro_right[0] = Gyro_raw_right[0] * 250.0f/32768.0f; // 250 deg/s full range for gyroscope
+                Gyro_right[1] = Gyro_raw_right[1] * 250.0f/32768.0f; // 250 deg/s full range for gyroscope
+                Gyro_right[2] = Gyro_raw_right[2] * 250.0f/32768.0f; // 250 deg/s full range for gyroscope
+                
+                
+                Gyro_right = Gyro_right * PI/180.0f;    //convert to radians
+                
+                //update quanternion & yaw pitch Roll vector
+                //Attitude_right_lever = MadgwickAHRSupdateIMU(Gyro_right, Acc_right, quanternion_right);
+                MadgwickAHRSupdateIMU(Gyro_right, Acc_right, quanternion_right, Attitude_right_lever);
+                
+                //left lever
+                IMU2.getMotion6FIFO(&Acc_raw_left[0], &Acc_raw_left[1], &Acc_raw_left[2], &Gyro_raw_left[0], &Gyro_raw_left[1], &Gyro_raw_left[2]);
+                
+                Acc_left[0] = Acc_raw_left[0] * 2.0f/32768.0f; // 2 g full range for accelerometer
+                Acc_left[1] = Acc_raw_left[1] * 2.0f/32768.0f; // 2 g full range for accelerometer
+                Acc_left[2] = Acc_raw_left[2] * 2.0f/32768.0f; // 2 g full range for accelerometer
+                
+                Gyro_left[0] = Gyro_raw_left[0] * 250.0f/32768.0f; // 250 deg/s full range for gyroscope
+                Gyro_left[1] = Gyro_raw_left[1] * 250.0f/32768.0f; // 250 deg/s full range for gyroscope
+                Gyro_left[2] = Gyro_raw_left[2] * 250.0f/32768.0f; // 250 deg/s full range for gyroscope
+                
+                Gyro_left = Gyro_left * PI/180.0f;    //convert to radians
+                
+                //update quanternion & yaw pitch Roll vector
+                MadgwickAHRSupdateIMU(Gyro_left, Acc_left, quanternion_left, Attitude_left_lever);
+                
+                //---------- Fill up the buffer ---------------------//
+                //fix the time stamp for the previous data packets
+                //milliseconds = millisecondsFIFORead - (numberPackets[0] - j)*(uint8_t)(1000/gyroSampleFreq);
+                milliseconds = millisecondsFIFORead + j*(uint8_t)(1000/gyroSampleFreq);
+                
+                
+                
+                // Begin building the buffer array
+                buffer[writeCounter+0] = MINUTE;
+                buffer[writeCounter+1] = SECOND;
+                
+                //split the long into 4 bytes little endian
+                buffer[writeCounter+5] = milliseconds >> 24 & 0xFF;  //MSB
+                buffer[writeCounter+4] = milliseconds >> 16 & 0xFF;  //CMSB
+                buffer[writeCounter+3] = milliseconds >> 8 & 0xFF;  //CLSB
+                buffer[writeCounter+2] = milliseconds & 0xFF;  //LSB
+                
+                //----------- IMU Data -------------------//
+                if (IMU1_online) {
+                    // lever angle from madgwick algorithm
+                    buffer[writeCounter+6] = (int)Attitude_right_lever[1] >> 8 & 0xFF;   // MSB
+                    buffer[writeCounter+7] = (int)Attitude_right_lever[1] & 0xFF;        //LSB
+                    
+                    //raw gyro
+                    buffer[writeCounter+8] = Gyro_raw_right[0] >> 8 & 0xFF;   // MSB
+                    buffer[writeCounter+9] = Gyro_raw_right[0] & 0xFF;        //LSB
+                    buffer[writeCounter+10] = Gyro_raw_right[1] >> 8 & 0xFF;   // MSB
+                    buffer[writeCounter+11] = Gyro_raw_right[1] & 0xFF;        //LSB
+                    buffer[writeCounter+12] = Gyro_raw_right[2] >> 8 & 0xFF;   // MSB
+                    buffer[writeCounter+13] = Gyro_raw_right[2] & 0xFF;        //LSB
+                    
+                    //raw acc
+                    buffer[writeCounter+14] = Acc_raw_right[0] >> 8 & 0xFF;   // MSB
+                    buffer[writeCounter+15] = Acc_raw_right[0] & 0xFF;        //LSB
+                    buffer[writeCounter+16] = Acc_raw_right[1] >> 8 & 0xFF;   // MSB
+                    buffer[writeCounter+17] = Acc_raw_right[1] & 0xFF;        //LSB
+                    buffer[writeCounter+18] = Acc_raw_right[2] >> 8 & 0xFF;   // MSB
+                    buffer[writeCounter+19] = Acc_raw_right[2] & 0xFF;        //LSB
+                }
+                else {
+                    // lever angle from madgwick algorithm
+                    buffer[writeCounter+6] = 0xFF;   // MSB
+                    buffer[writeCounter+7] = 0xFF;        //LSB
+                    
+                    //raw gyro
+                    buffer[writeCounter+8] = 0xFF;   // MSB
+                    buffer[writeCounter+9] = 0xFF;        //LSB
+                    buffer[writeCounter+10] = 0xFF;   // MSB
+                    buffer[writeCounter+11] = 0xFF;        //LSB
+                    buffer[writeCounter+12] = 0xFF;   // MSB
+                    buffer[writeCounter+13] = 0xFF;        //LSB
+                    
+                    //raw acc
+                    buffer[writeCounter+14] = 0xFF;   // MSB
+                    buffer[writeCounter+15] = 0xFF;        //LSB
+                    buffer[writeCounter+16] = 0xFF;   // MSB
+                    buffer[writeCounter+17] = 0xFF;        //LSB
+                    buffer[writeCounter+18] = 0xFF;   // MSB
+                    buffer[writeCounter+19] = 0xFF;        //LSB
+                }
+                
+                if (IMU2_online) {
+                    // lever angle from madgwick algorithm
+                    buffer[writeCounter+20] = (int)Attitude_left_lever[1] >> 8 & 0xFF;   // MSB
+                    buffer[writeCounter+21] = (int)Attitude_left_lever[1] & 0xFF;        //LSB
+                    
+                    //raw gyro
+                    buffer[writeCounter+22] = Gyro_raw_left[0] >> 8 & 0xFF;   // MSB
+                    buffer[writeCounter+23] = Gyro_raw_left[0] & 0xFF;        //LSB
+                    buffer[writeCounter+24] = Gyro_raw_left[1] >> 8 & 0xFF;   // MSB
+                    buffer[writeCounter+25] = Gyro_raw_left[1] & 0xFF;        //LSB
+                    buffer[writeCounter+26] = Gyro_raw_left[2] >> 8 & 0xFF;   // MSB
+                    buffer[writeCounter+27] = Gyro_raw_left[2] & 0xFF;        //LSB
+                    
+                    //raw acc
+                    buffer[writeCounter+28] = Acc_raw_left[0] >> 8 & 0xFF;   // MSB
+                    buffer[writeCounter+29] = Acc_raw_left[0] & 0xFF;        //LSB
+                    buffer[writeCounter+30] = Acc_raw_left[1] >> 8 & 0xFF;   // MSB
+                    buffer[writeCounter+31] = Acc_raw_left[1] & 0xFF;        //LSB
+                    buffer[writeCounter+32] = Acc_raw_left[2] >> 8 & 0xFF;   // MSB
+                    buffer[writeCounter+33] = Acc_raw_left[2] & 0xFF;        //LSB
+                }
+                else {
+                    // lever angle from madgwick algorithm
+                    buffer[writeCounter+20] = 0xFF;   // MSB
+                    buffer[writeCounter+21] = 0xFF;        //LSB
+                    
+                    //raw gyro
+                    buffer[writeCounter+22] = 0xFF;   // MSB
+                    buffer[writeCounter+23] = 0xFF;        //LSB
+                    buffer[writeCounter+24] = 0xFF;   // MSB
+                    buffer[writeCounter+25] = 0xFF;        //LSB
+                    buffer[writeCounter+26] = 0xFF;   // MSB
+                    buffer[writeCounter+27] = 0xFF;        //LSB
+                    
+                    //raw acc
+                    buffer[writeCounter+28] = 0xFF;   // MSB
+                    buffer[writeCounter+29] = 0xFF;        //LSB
+                    buffer[writeCounter+30] = 0xFF;   // MSB
+                    buffer[writeCounter+31] = 0xFF;        //LSB
+                    buffer[writeCounter+32] = 0xFF;   // MSB
+                    buffer[writeCounter+33] = 0xFF;        //LSB
+                }
+                
+                //------------- Reed Data ----------------//
+                //raw reed data and counter
+                buffer[writeCounter+34] = reed_stat_left[0] >> 8 & 0xFF;   // MSB
+                buffer[writeCounter+35] = reed_stat_left[0] & 0xFF;        //LSB
+                buffer[writeCounter+36] = reed_stat_left[1] >> 8 & 0xFF;   // MSB
+                buffer[writeCounter+37] = reed_stat_left[1] & 0xFF;        //LSB
+                buffer[writeCounter+38] = WheelLeftRot >> 8 & 0xFF;       // MSB
+                buffer[writeCounter+39] = WheelLeftRot & 0xFF;            //LSB
+                
+                buffer[writeCounter+40] = reed_stat_right[0] >> 8 & 0xFF;   // MSB
+                buffer[writeCounter+41] = reed_stat_right[0] & 0xFF;        //LSB
+                buffer[writeCounter+42] = reed_stat_right[1] >> 8 & 0xFF;   // MSB
+                buffer[writeCounter+43] = reed_stat_right[1] & 0xFF;        //LSB
+                buffer[writeCounter+44] = WheelRightRot >> 8 & 0xFF;       // MSB
+                buffer[writeCounter+45] = WheelRightRot & 0xFF;            //LSB
+                
+                // ----------- Sample Rate ------------//
+                buffer[writeCounter+46] = (int)measured_cycle_rate >> 8 & 0xFF;   // MSB
+                buffer[writeCounter+47] = (int)measured_cycle_rate & 0xFF;        //LSB
+                
+                // ----------- pot angle ------------//
+                buffer[writeCounter+48] = potAngle >> 8 & 0xFF;   // MSB
+                buffer[writeCounter+49] = potAngle & 0xFF;        //LSB
+                
+                writeCounter += dataBlock; //increase the counter
+            }//end of for
+        }
+            
+    }//end of if
+    else {
+        //Serial.println("data not ready");
+    }
+    gyroDataRdy = false;        //reset new data flag
+    
+    
+#endif //log
     
 #ifdef ECHO
-    /*
+    
     if(IMU1_online && rtc.isrunning()) {
         
         Serial.print("lever angle right: ");
@@ -654,7 +905,21 @@ void loop()
         Serial.print("\t lever angle left: ");
         Serial.print(Attitude_left_lever[1]);
     }
-    */
+    
+    Serial.print("\t gz right: ");
+    Serial.print(Gyro_raw_right[2]);
+    Serial.print("\t ");
+    
+    Serial.print("\t gz left: ");
+    Serial.print(Gyro_raw_left[2]);
+    Serial.print("\t ");
+    
+#ifdef POT
+    Serial.print("\t Pot: ");
+    Serial.print(potAngle);
+    Serial.print("\t ");
+#endif
+    /*
     Serial.print("Left rot: ");
     Serial.print(WheelLeftRot);
     
@@ -675,6 +940,7 @@ void loop()
     Serial.print(reed_stat_left[0]);
     Serial.print("\t left reed 2: ");
     Serial.print(reed_stat_left[1]);
+     */
     /*
      Serial.print("q right: ");
      Serial.print(quanternion_right[0]);
@@ -720,8 +986,12 @@ void loop()
     
 #endif //echo
     
+    //sample rate handling
+    
     loop_time = millis() - begin_of_loop;     //milliseconds
     measured_cycle_rate = 1000*(1/loop_time);   //hz
+    
+    //if we are going too fast delay
     if (measured_cycle_rate > sampleFreq) {
         delay_time = ((float)(1/sampleFreq)*1000) - loop_time;
         
@@ -749,7 +1019,7 @@ void loop()
         mpu_int_triggered = false;
         
         if ((millis() - motionTimer) >= motionTimePeriod) {
-            sleepNow();
+            //sleepNow();
         }
         
     }
@@ -765,6 +1035,7 @@ void loop()
     /*wakeUpCause = PM->RCAUSE.reg;
     Serial.println(wakeUpCause);
     delay(1000);*/
+    wdtClear();
     
     
 }   // END OF LOOP
@@ -777,9 +1048,190 @@ void IMU_int() {
     // timers will not work in an ISR
     // So just set a flag
     mpu_int_triggered = true;
-    sleeping = false;
-
+    gyroDataRdy = true;
+    //Serial.println("in interrupt");
+    /*
+    if(sleeping){
+        //wake up and set the interrupt pin to data ready interrupt
+        sleeping = false;
+        IMU1.setDataRdyInt();
+        IMU2.setDataRdyInt();
+    }
+    else {
+        //poll data
+        //IMU 1
+        IMU1.getMotion6(&Acc_raw_right[0], &Acc_raw_right[1], &Acc_raw_right[2], &Gyro_raw_right[0], &Gyro_raw_right[1], &Gyro_raw_right[2]);
+        
+        Acc_right[0] = Acc_raw_right[0] * 2.0f/32768.0f; // 2 g full range for accelerometer
+        Acc_right[1] = Acc_raw_right[1] * 2.0f/32768.0f; // 2 g full range for accelerometer
+        Acc_right[2] = Acc_raw_right[2] * 2.0f/32768.0f; // 2 g full range for accelerometer
+        
+        Gyro_right[0] = Gyro_raw_right[0] * 250.0f/32768.0f; // 250 deg/s full range for gyroscope
+        Gyro_right[1] = Gyro_raw_right[1] * 250.0f/32768.0f; // 250 deg/s full range for gyroscope
+        Gyro_right[2] = Gyro_raw_right[2] * 250.0f/32768.0f; // 250 deg/s full range for gyroscope
+        
+        
+        Gyro_right = Gyro_right * PI/180.0f;    //convert to radians
+        
+        //update quanternion & yaw pitch Roll vector
+        MadgwickAHRSupdateIMU(Gyro_right, Acc_right, quanternion_right, Attitude_right_lever);
+        
+        //imu 2
+        IMU2.getMotion6(&Acc_raw_left[0], &Acc_raw_left[1], &Acc_raw_left[2], &Gyro_raw_left[0], &Gyro_raw_left[1], &Gyro_raw_left[2]);
+        
+        Acc_left[0] = Acc_raw_left[0] * 2.0f/32768.0f; // 2 g full range for accelerometer
+        Acc_left[1] = Acc_raw_left[1] * 2.0f/32768.0f; // 2 g full range for accelerometer
+        Acc_left[2] = Acc_raw_left[2] * 2.0f/32768.0f; // 2 g full range for accelerometer
+        
+        Gyro_left[0] = Gyro_raw_left[0] * 250.0f/32768.0f; // 250 deg/s full range for gyroscope
+        Gyro_left[1] = Gyro_raw_left[1] * 250.0f/32768.0f; // 250 deg/s full range for gyroscope
+        Gyro_left[2] = Gyro_raw_left[2] * 250.0f/32768.0f; // 250 deg/s full range for gyroscope
+        
+        Gyro_left = Gyro_left * PI/180.0f;    //convert to radians
+        
+        //update quanternion & yaw pitch Roll vector
+        MadgwickAHRSupdateIMU(Gyro_left, Acc_left, quanternion_left, Attitude_left_lever);
+        
+        //---------- Fill up the buffer ---------------------//
+        
+        milliseconds = (uint32_t)millis();
+        
+        // Begin building the buffer array
+        buffer[writeCounter+0] = MINUTE;
+        buffer[writeCounter+1] = SECOND;
+        
+        //split the long into 4 bytes little endian
+        buffer[writeCounter+5] = milliseconds >> 24 & 0xFF;  //MSB
+        buffer[writeCounter+4] = milliseconds >> 16 & 0xFF;  //CMSB
+        buffer[writeCounter+3] = milliseconds >> 8 & 0xFF;  //CLSB
+        buffer[writeCounter+2] = milliseconds & 0xFF;  //LSB
+        
+        //----------- IMU Data -------------------//
+        if (IMU1_online) {
+            // lever angle from madgwick algorithm
+            buffer[writeCounter+6] = (int)Attitude_right_lever[1] >> 8 & 0xFF;   // MSB
+            buffer[writeCounter+7] = (int)Attitude_right_lever[1] & 0xFF;        //LSB
+            
+            //raw gyro
+            buffer[writeCounter+8] = Gyro_raw_right[0] >> 8 & 0xFF;   // MSB
+            buffer[writeCounter+9] = Gyro_raw_right[0] & 0xFF;        //LSB
+            buffer[writeCounter+10] = Gyro_raw_right[1] >> 8 & 0xFF;   // MSB
+            buffer[writeCounter+11] = Gyro_raw_right[1] & 0xFF;        //LSB
+            buffer[writeCounter+12] = Gyro_raw_right[2] >> 8 & 0xFF;   // MSB
+            buffer[writeCounter+13] = Gyro_raw_right[2] & 0xFF;        //LSB
+            
+            //raw acc
+            buffer[writeCounter+14] = Acc_raw_right[0] >> 8 & 0xFF;   // MSB
+            buffer[writeCounter+15] = Acc_raw_right[0] & 0xFF;        //LSB
+            buffer[writeCounter+16] = Acc_raw_right[1] >> 8 & 0xFF;   // MSB
+            buffer[writeCounter+17] = Acc_raw_right[1] & 0xFF;        //LSB
+            buffer[writeCounter+18] = Acc_raw_right[2] >> 8 & 0xFF;   // MSB
+            buffer[writeCounter+19] = Acc_raw_right[2] & 0xFF;        //LSB
+        }
+        else {
+            // lever angle from madgwick algorithm
+            buffer[writeCounter+6] = 0xFF;   // MSB
+            buffer[writeCounter+7] = 0xFF;        //LSB
+            
+            //raw gyro
+            buffer[writeCounter+8] = 0xFF;   // MSB
+            buffer[writeCounter+9] = 0xFF;        //LSB
+            buffer[writeCounter+10] = 0xFF;   // MSB
+            buffer[writeCounter+11] = 0xFF;        //LSB
+            buffer[writeCounter+12] = 0xFF;   // MSB
+            buffer[writeCounter+13] = 0xFF;        //LSB
+            
+            //raw acc
+            buffer[writeCounter+14] = 0xFF;   // MSB
+            buffer[writeCounter+15] = 0xFF;        //LSB
+            buffer[writeCounter+16] = 0xFF;   // MSB
+            buffer[writeCounter+17] = 0xFF;        //LSB
+            buffer[writeCounter+18] = 0xFF;   // MSB
+            buffer[writeCounter+19] = 0xFF;        //LSB
+        }
+        
+        if (IMU2_online) {
+            // lever angle from madgwick algorithm
+            buffer[writeCounter+20] = (int)Attitude_left_lever[1] >> 8 & 0xFF;   // MSB
+            buffer[writeCounter+21] = (int)Attitude_left_lever[1] & 0xFF;        //LSB
+            
+            //raw gyro
+            buffer[writeCounter+22] = Gyro_raw_left[0] >> 8 & 0xFF;   // MSB
+            buffer[writeCounter+23] = Gyro_raw_left[0] & 0xFF;        //LSB
+            buffer[writeCounter+24] = Gyro_raw_left[1] >> 8 & 0xFF;   // MSB
+            buffer[writeCounter+25] = Gyro_raw_left[1] & 0xFF;        //LSB
+            buffer[writeCounter+26] = Gyro_raw_left[2] >> 8 & 0xFF;   // MSB
+            buffer[writeCounter+27] = Gyro_raw_left[2] & 0xFF;        //LSB
+            
+            //raw acc
+            buffer[writeCounter+28] = Acc_raw_left[0] >> 8 & 0xFF;   // MSB
+            buffer[writeCounter+29] = Acc_raw_left[0] & 0xFF;        //LSB
+            buffer[writeCounter+30] = Acc_raw_left[1] >> 8 & 0xFF;   // MSB
+            buffer[writeCounter+31] = Acc_raw_left[1] & 0xFF;        //LSB
+            buffer[writeCounter+32] = Acc_raw_left[2] >> 8 & 0xFF;   // MSB
+            buffer[writeCounter+33] = Acc_raw_left[2] & 0xFF;        //LSB
+        }
+        else {
+            // lever angle from madgwick algorithm
+            buffer[writeCounter+20] = 0xFF;   // MSB
+            buffer[writeCounter+21] = 0xFF;        //LSB
+            
+            //raw gyro
+            buffer[writeCounter+22] = 0xFF;   // MSB
+            buffer[writeCounter+23] = 0xFF;        //LSB
+            buffer[writeCounter+24] = 0xFF;   // MSB
+            buffer[writeCounter+25] = 0xFF;        //LSB
+            buffer[writeCounter+26] = 0xFF;   // MSB
+            buffer[writeCounter+27] = 0xFF;        //LSB
+            
+            //raw acc
+            buffer[writeCounter+28] = 0xFF;   // MSB
+            buffer[writeCounter+29] = 0xFF;        //LSB
+            buffer[writeCounter+30] = 0xFF;   // MSB
+            buffer[writeCounter+31] = 0xFF;        //LSB
+            buffer[writeCounter+32] = 0xFF;   // MSB
+            buffer[writeCounter+33] = 0xFF;        //LSB
+        }
+        
+        //------------- Reed Data ----------------//
+        //raw reed data and counter
+        buffer[writeCounter+34] = reed_stat_left[0] >> 8 & 0xFF;   // MSB
+        buffer[writeCounter+35] = reed_stat_left[0] & 0xFF;        //LSB
+        buffer[writeCounter+36] = reed_stat_left[1] >> 8 & 0xFF;   // MSB
+        buffer[writeCounter+37] = reed_stat_left[1] & 0xFF;        //LSB
+        buffer[writeCounter+38] = WheelLeftRot >> 8 & 0xFF;       // MSB
+        buffer[writeCounter+39] = WheelLeftRot & 0xFF;            //LSB
+        
+        buffer[writeCounter+40] = reed_stat_right[0] >> 8 & 0xFF;   // MSB
+        buffer[writeCounter+41] = reed_stat_right[0] & 0xFF;        //LSB
+        buffer[writeCounter+42] = reed_stat_right[1] >> 8 & 0xFF;   // MSB
+        buffer[writeCounter+43] = reed_stat_right[1] & 0xFF;        //LSB
+        buffer[writeCounter+44] = WheelRightRot >> 8 & 0xFF;       // MSB
+        buffer[writeCounter+45] = WheelRightRot & 0xFF;            //LSB
+        
+        // ----------- Sample Rate ------------//
+        buffer[writeCounter+46] = (int)measured_cycle_rate >> 8 & 0xFF;   // MSB
+        buffer[writeCounter+47] = (int)measured_cycle_rate & 0xFF;        //LSB
+        
+        writeCounter += dataBlock; //increase the counter
+    }
+    
+    if(writeCounter >= bufferSize) {
+        int iii = 0;
+        //push over data to write array
+        for (iii = 0; iii < bufferSize; iii++){
+            dataToWrite[iii] = buffer[iii];
+        }
+        timeToWrite = true;
+        writeCounter = 0;
+        
+    }
+    
+    Serial.println(writeCounter);
+    Serial.println("end interrupt");
+     */
 }
+
 //Rotary Encoder Right Wheel
 void reedRightIntFirst () {
     //timestamp
@@ -1003,6 +1455,11 @@ void TC4_Handler() {
 void sleepNow() {
     
     sleeping = true;
+    //set wake up interrupt on motion detection
+    IMU1.setMotionIntProcess();
+    IMU2.setMotionIntProcess();
+    
+    //turn gyros off to save power
     IMU1.gyrosOff();
     IMU2.gyrosOff();
     
@@ -1043,7 +1500,6 @@ void sleepNow() {
     //we are here after wake up and respective interrupts
     IMU1.gyrosOn();
     IMU2.gyrosOn();
-    Serial.println("did we make it?");
     
 }
 
@@ -1132,10 +1588,10 @@ void MadgwickAHRSupdateIMU(Vector3<float> gyro, Vector3<float> acc, float q[4], 
     }
     
     // Integrate rate of change of quaternion to yield quaternion
-    q[0] += qDot1 * (1.0f / sampleFreq);
-    q[1] += qDot2 * (1.0f / sampleFreq);
-    q[2] += qDot3 * (1.0f / sampleFreq);
-    q[3] += qDot4 * (1.0f / sampleFreq);
+    q[0] += qDot1 * (1.0f / gyroSampleFreq);
+    q[1] += qDot2 * (1.0f / gyroSampleFreq);
+    q[2] += qDot3 * (1.0f / gyroSampleFreq);
+    q[3] += qDot4 * (1.0f / gyroSampleFreq);
     
     // Normalise quaternion
     recipNorm = invSqrt(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]);

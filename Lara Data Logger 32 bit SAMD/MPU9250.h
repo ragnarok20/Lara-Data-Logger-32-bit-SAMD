@@ -435,9 +435,15 @@ class MPU9250 {
         void setMotionIntProcess();
         void clearMotionIntProcess();
     
+        //data ready interrupt
+        void setDataRdyInt();
+    
         // enable / disable gyros for power saving
         void gyrosOn();
         void gyrosOff();
+    
+        // 1 set of acc and gyro data from the FIFO
+    void getMotion6FIFO(int16_t* ax, int16_t* ay, int16_t* az, int16_t* gx, int16_t* gy, int16_t* gz);
     
         void initialize();
         bool testConnection();
