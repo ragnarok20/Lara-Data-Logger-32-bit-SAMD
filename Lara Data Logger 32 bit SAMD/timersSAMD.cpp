@@ -25,19 +25,19 @@ void initTimers() {
     // ----------- WDT --------------------//
     
     //divisor
-    GCLK->GENDIV.bit.ID = 0x01;     //general clock 1
+    GCLK->GENDIV.bit.ID = 0x06;     //general clock 6
     //GCLK->GENDIV.bit.DIV = 32;   //division: will result to ~8s interrupt if EWOFFSET = 0xA
     GCLK->GENDIV.bit.DIV = 128;   //division: will result to ~30s interrupt if EWOFFSET = 0xA
     //GCLK->GENDIV.bit.DIV = 256;   //division: will result to ~1min interrupt if EWOFFSET = 0xA
     
     //set generic clock one to wdt
-    GCLK->CLKCTRL.bit.GEN = 0x1;    //general clock 1
+    GCLK->CLKCTRL.bit.GEN = 0x6;    //general clock 6
     GCLK->CLKCTRL.bit.ID = 0x03;    //WDT clock
     GCLK->CLKCTRL.bit.CLKEN = 1;    // enable the clock
     while (GCLK->STATUS.bit.SYNCBUSY);
     
     //32kHz reference oscillator
-    GCLK->GENCTRL.bit.ID = 0x01;    //general clock 1
+    GCLK->GENCTRL.bit.ID = 0x06;    //general clock 6
     GCLK->GENCTRL.bit.SRC = 0x03;      //OSCULP32K
     GCLK->GENCTRL.bit.GENEN = 1;    //enable generator
     while (GCLK->STATUS.reg & GCLK_STATUS_SYNCBUSY);
