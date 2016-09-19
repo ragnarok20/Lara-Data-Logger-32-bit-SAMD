@@ -279,7 +279,7 @@ void MPU9250::initialize() {
         MPU9250::writeSPI(MPU9250_RA_PWR_MGMT_1,0x01);
         //MPU9250::writeSPI(MPU9250_RA_INT_PIN_CFG, 0b00000010);	//enable i2c passthrough
         MPU9250::writeSPI(MPU9250_RA_USER_CTRL, 0b00010000);	//fifo disable, disable i2c master & enable SPI
-        MPU9250::writeSPI(MPU9250_RA_CONFIG, 0b00000101);	//disable Fsync and 10hz DLPF
+        MPU9250::writeSPI(MPU9250_RA_CONFIG, 0b01000101);	//disable Fsync and 10hz DLPF, FIFO mode to keep old data
         
     }
     else {
